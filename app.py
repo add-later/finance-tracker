@@ -50,6 +50,9 @@ for i, subpage in enumerate(data["Доходы"].keys()):
             value = st.number_input(f"{subpage} → {field}", min_value=0.0, step=100.0, value=None,
                                     key=f"income_{subpage}_{field}")
             inputs[f"Доходы-{subpage}-{field}"] = value
+        value = st.number_input(f"Факт → {subpage}", min_value=0.0, step=100.0, value=None,
+                                    key=f"income_факт_{subpage}")
+        inputs[f"Факт-{subpage}"] = value
 
 # ---------------- Расходы ----------------
 st.header("Расходы 💸💸💸")

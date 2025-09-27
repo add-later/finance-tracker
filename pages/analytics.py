@@ -3,38 +3,42 @@ import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import plotly.express as px
-import datetime
+import plotly.graph_objects as go
 import os
-from dotenv import load_dotenv
 import json
+from dotenv import load_dotenv
 
+# ---------------- Config & Setup ----------------
+st.set_page_config(page_title="📊 Аналитика финансов", layout="wide")
 
 try:
     SHEET_URL = st.secrets["SHEET_URL"]
-    data = json.loads(st.secrets["COLUMN_LIST"])
-    data = json.loads(st.secrets["COLUMN_LIST"])
-    credentials=json.loads(st.secrets["CREDENTIALS"])
-except:
-    load_dotenv('../.env')
+    credentials = json.loads(st.secrets["CREDENTIALS"])
+    column_list = json.loads(st.secrets["COLUMN_LIST"])
+except Exception:
+    load_dotenv("../.env")
     SHEET_URL = os.environ["SHEET_URL"]
-    data = json.loads(os.environ["COLUMN_LIST"])
-    credentials=json.loads(os.environ["CREDENTIALS"])
+    credentials = json.loads(os.environ["CREDENTIALS"])
+    column_list = json.loads(os.environ["COLUMN_LIST"])
 
-
-# ---------------- Google Sheets Setup ----------------
+# ---------------- Google Sheets ----------------
 scope = ["https://spreadsheets.google.com/feeds",
          "https://www.googleapis.com/auth/drive"]
 
 creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials, scope)
 client = gspread.authorize(creds)
-
 sheet = client.open_by_url(SHEET_URL).sheet1
 
-# ---------------- Load Data ----------------
-@st.cache_data
+# ---------------- Data Loader ----------------
+@st.cache_data(ttl=600)
 def load_data():
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
+
+    if "date" not in df.columns:
+        st.error("В таблице отсутствует колонка 'date'")
+        return pd.DataFrame()
+
     df["date"] = pd.to_datetime(df["date"])
     return df
 
@@ -42,116 +46,207 @@ df = load_data()
 
 st.title("📊 Аналитика финансов")
 
-# ---------------- Time Filter ----------------
-period = st.selectbox(
-    "Выберите период",
-    ["День", "Неделя", "Месяц", "Квартал", "Год", "Все время"]
-)
-
-today = datetime.date.today()
-
-if period == "День":
-    df_period = df[df["date"].dt.date == today]
-elif period == "Неделя":
-    week_start = today - datetime.timedelta(days=today.weekday())
-    df_period = df[(df["date"].dt.date >= week_start) & (df["date"].dt.date <= today)]
-elif period == "Месяц":
-    df_period = df[(df["date"].dt.month == today.month) & (df["date"].dt.year == today.year)]
-elif period == "Квартал":
-    df_period = df[(df["date"].dt.to_period("Q") == pd.Period(today, freq="Q"))]
-elif period == "Год":
-    df_period = df[df["date"].dt.year == today.year]
-else:
-    df_period = df
-
-if df_period.empty:
-    st.warning("Нет данных за выбранный период.")
+if df.empty:
+    st.warning("Нет данных для отображения")
     st.stop()
 
-# ---------------- Income / Expenses Aggregation ----------------
-income_cols = [col for col in df.columns if col.startswith("Доходы")]
-expense_cols = [col for col in df.columns if col.startswith("Расходы")]
+# ---------------- Cashflow per Shop ----------------
+def calc_cash(df, shop):
+    """Расчет налички и кассы для заданного магазина"""
+    shop_df = df[["date"] + [c for c in df.columns if f"Доходы-{shop}" in c or "Расходы" in c]].copy()
+    shop_df = shop_df.sort_values("date").reset_index(drop=True)
 
-df_period["Доходы"] = df_period[income_cols].sum(axis=1)
-df_period["Расходы"] = df_period[expense_cols].sum(axis=1)
+    def safe_sum(subdf):
+        return subdf.apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
 
-total_income = df_period["Доходы"].sum()
-total_expenses = df_period["Расходы"].sum()
-balance = total_income - total_expenses
+    shop_df["Выручка"] = safe_sum(shop_df.filter(like=f"Доходы-{shop}-Выручка"))
+    shop_df["Терминалы"] = safe_sum(shop_df.filter(like=f"Доходы-{shop}-Терминал"))
+    shop_df["Перевод на Gold"] = safe_sum(shop_df.filter(like=f"Доходы-{shop}-Перевод на Gold"))
+    shop_df["Расходы"] = safe_sum(shop_df.filter(like=f"Расходы-{shop}"))
+    shop_df["Наличка"] = 0.0
+    shop_df["В кассе"] = 0.0
 
-col1, col2, col3 = st.columns(3)
-col1.metric("💰 Текущий баланс", f"{balance:,.0f} ₸")
-col2.metric("📈 Доходы", f"{total_income:,.0f} ₸")
-col3.metric("📉 Расходы", f"{total_expenses:,.0f} ₸")
+    for i in range(len(shop_df)):
+        dt = {"ЦУМ": 214628, "Галерея": 252181}
+        prev_cash = shop_df.loc[i - 1, "В кассе"] if i > 0 else dt[shop]
+        shop_df.loc[i, "Наличка"] = (
+            prev_cash
+            + shop_df.loc[i, "Выручка"]
+            - shop_df.loc[i, "Терминалы"]
+            - shop_df.loc[i, "Перевод на Gold"]
+        )
+        shop_df.loc[i, "В кассе"] = shop_df.loc[i, "Наличка"] - shop_df.loc[i, "Расходы"]
+    return shop_df[["date", "Наличка", "В кассе"]]
 
-st.write("---")
+cash_cum = calc_cash(df, "ЦУМ")
+cash_gal = calc_cash(df, "Галерея")
 
-# ---------------- Expenses Distribution ----------------
-expenses_long = df_period.melt(
-    id_vars=["date"], value_vars=expense_cols,
-    var_name="Категория", value_name="Сумма"
-)
-expenses_long = expenses_long[expenses_long["Сумма"] > 0]
+# ---------------- Metrics by Shop ----------------
+latest_date = df["date"].max()
+val_cum = cash_cum[cash_cum["date"] == latest_date].iloc[0]
+val_gal = cash_gal[cash_gal["date"] == latest_date].iloc[0]
 
-if not expenses_long.empty:
-    expenses_long[["Тип", "Категория", "Подкатегория"]] = expenses_long["Категория"].str.split("-", 2, expand=True)
+col1, col2 = st.columns(2)
 
-    category_summary = expenses_long.groupby("Категория")["Сумма"].sum().reset_index()
-    fig_cat = px.pie(category_summary, names="Категория", values="Сумма", title="📊 Расходы по категориям")
-    st.plotly_chart(fig_cat, use_container_width=True)
+with col1:
+    st.subheader("ЦУМ")
+    if "Факт-ЦУМ" in df.columns and val_cum["В кассе"] < df[df["date"] == latest_date]["Факт-ЦУМ"].iloc[0]:
+        st.error(f"В кассе: {val_gal['В кассе']:.0f} Факт: {df[df["date"] == latest_date]["Факт-ЦУМ"].iloc[0]}")
+    else:
+        st.success(f"В кассе: {val_cum['В кассе']:.0f}")
+    st.metric("Наличка", f"{val_cum['Наличка']:.0f}")
 
-    selected_category = st.selectbox("Выберите категорию для детализации", category_summary["Категория"].unique())
-    subcat_summary = expenses_long[expenses_long["Категория"] == selected_category]
-    subcat_summary = subcat_summary.groupby("Подкатегория")["Сумма"].sum().reset_index()
-
-    fig_subcat = px.bar(subcat_summary, x="Подкатегория", y="Сумма", title=f"📂 Подкатегории: {selected_category}")
-    st.plotly_chart(fig_subcat, use_container_width=True)
-else:
-    st.info("Нет расходов за выбранный период.")
-
-# ---------------- Income Distribution (Выручка ЦУМ / Галерея) ----------------
-income_long = df_period.melt(
-    id_vars=["date"], value_vars=income_cols,
-    var_name="Категория", value_name="Сумма"
-)
-income_long = income_long[income_long["Сумма"] > 0]
-income_long[["Тип", "Магазин", "Подкатегория"]] = (
-    income_long["Категория"].str.split("-", n=2, expand=True)
-)
-
-
-# Filter only "Выручка"
-income_vyruchka = income_long[income_long["Подкатегория"] == "Выручка"]
-if not income_vyruchka.empty:
-    vyruchka_summary = income_vyruchka.groupby("Магазин")["Сумма"].sum().reset_index()
-    fig_income_pie = px.pie(vyruchka_summary, names="Магазин", values="Сумма", title="🏪 Доходы (Выручка: ЦУМ vs Галерея)")
-    st.plotly_chart(fig_income_pie, use_container_width=True)
+with col2:
+    st.subheader("Галерея")
+    if "Факт-Галерея" in df.columns and val_gal["В кассе"] < df[df["date"] == latest_date]["Факт-Галерея"].iloc[0]:
+        st.error(f"В кассе: {val_gal['В кассе']:.0f} Факт: {df[df["date"] == latest_date]["Факт-Галерея"].iloc[0]}")
+    else:
+        st.success(f"В кассе: {val_gal['В кассе']:.0f}")
+    st.metric("Наличка", f"{val_gal['Наличка']:.0f}")
 
 st.write("---")
 
-# ---------------- Income Trend ----------------
-income_trend = df_period.groupby("date")[income_cols].sum().sum(axis=1).reset_index(name="Доходы")
-if not income_trend.empty:
-    fig_income = px.line(income_trend, x="date", y="Доходы", title="📈 Динамика доходов")
+# ---------------- Cash Dynamics ----------------
+st.subheader("Динамика кассы")
+fig1 = go.Figure()
+fig1.add_trace(go.Scatter(x=cash_cum["date"], y=cash_cum["В кассе"], mode="lines+markers", name="ЦУМ В кассе"))
+fig1.add_trace(go.Scatter(x=cash_gal["date"], y=cash_gal["В кассе"], mode="lines+markers", name="Галерея В кассе"))
+st.plotly_chart(fig1, use_container_width=True)
+
+st.subheader("Наличка")
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(x=cash_cum["date"], y=cash_cum["Наличка"], mode="lines+markers", name="ЦУМ Наличка"))
+fig2.add_trace(go.Scatter(x=cash_gal["date"], y=cash_gal["Наличка"], mode="lines+markers", name="Галерея Наличка"))
+st.plotly_chart(fig2, use_container_width=True)
+
+st.write("---")
+
+# ---------------- Доход ----------------
+# ---------------- Percentage Dynamics ----------------
+st.subheader("Доля дохода от выручки")
+
+def calc_percentage(df, shop):
+    col_income = f"Доходы-{shop}-Доход за день"
+    col_revenue = f"Доходы-{shop}-Выручка"
+    if col_income in df.columns and col_revenue in df.columns:
+        temp = df[["date", col_income, col_revenue]].copy()
+        temp["%"] = (pd.to_numeric(temp[col_income], errors="coerce") /
+                     pd.to_numeric(temp[col_revenue], errors="coerce")) * 100
+        return temp[["date", "%"]]
+    return pd.DataFrame(columns=["date", "%"])
+
+perc_cum = calc_percentage(df, "ЦУМ")
+perc_gal = calc_percentage(df, "Галерея")
+
+fig_perc = go.Figure()
+if not perc_cum.empty:
+    fig_perc.add_trace(go.Scatter(
+        x=perc_cum["date"], y=perc_cum["%"],
+        mode="lines+markers", name="ЦУМ %"
+    ))
+if not perc_gal.empty:
+    fig_perc.add_trace(go.Scatter(
+        x=perc_gal["date"], y=perc_gal["%"],
+        mode="lines+markers", name="Галерея %"
+    ))
+
+fig_perc.update_layout(yaxis_title="%", xaxis_title="Дата")
+st.plotly_chart(fig_perc, use_container_width=True)
+
+
+
+# ---------------- Period Analysis ----------------
+period = st.selectbox("Период анализа", ["День", "Неделя", "Месяц", "Квартал", "Год"])
+
+if period == "День":
+    df_grouped = df.groupby(df["date"].dt.date).sum(numeric_only=True)
+elif period == "Неделя":
+    df_grouped = df.groupby(df["date"].dt.to_period("W")).sum(numeric_only=True)
+elif period == "Месяц":
+    df_grouped = df.groupby(df["date"].dt.to_period("M")).sum(numeric_only=True)
+elif period == "Квартал":
+    df_grouped = df.groupby(df["date"].dt.to_period("Q")).sum(numeric_only=True)
+elif period == "Год":
+    df_grouped = df.groupby(df["date"].dt.to_period("Y")).sum(numeric_only=True)
+
+df_grouped.index = df_grouped.index.astype(str)
+
+# Available numeric columns after grouping
+available_cols = df_grouped.columns.tolist()
+
+income_cols = [c for c in df.columns if c.startswith("Доходы")]
+expense_cols = [c for c in df.columns if c.startswith("Расходы")]
+
+# Only keep existing ones
+income_cols = [c for c in income_cols if c in available_cols]
+expense_cols = [c for c in expense_cols if c in available_cols]
+
+# Compute totals safely
+total_income = df_grouped[income_cols].sum(axis=1) if income_cols else pd.Series(0, index=df_grouped.index)
+total_expense = df_grouped[expense_cols].sum(axis=1) if expense_cols else pd.Series(0, index=df_grouped.index)
+balance = total_income - total_expense
+
+
+total_income = df_grouped[income_cols].sum(axis=1)
+total_expense = df_grouped[expense_cols].sum(axis=1)
+balance = total_income - total_expense
+
+c1, c2, c3 = st.columns(3)
+c1.metric("💰 Доходы (всего)", f"{total_income.sum():,.0f}")
+c2.metric("💸 Расходы (всего)", f"{total_expense.sum():,.0f}")
+c3.metric("📌 Баланс", f"{balance.sum():,.0f}")
+
+st.write("---")
+
+st.subheader("Структура доходов и расходов")
+
+def aggregate_by_category(cols, df):
+    """Group columns by the 2nd part of their name (after '-')"""
+    category_totals = {}
+    for col in cols:
+        parts = col.split("-")
+        if len(parts) >= 2:
+            cat = parts[1]  # take the second token
+            category_totals[cat] = category_totals.get(cat, 0) + df[col].sum()
+    return category_totals
+
+# --- Income pie by category ---
+col1, col2 = st.columns(2)
+
+with col1:
+    income_cats = aggregate_by_category(income_cols, df)
+    fig_income = px.pie(values=list(income_cats.values()), names=list(income_cats.keys()), 
+                        title="Доходы по категориям")
     st.plotly_chart(fig_income, use_container_width=True)
 
-# ---------------- Expenses Trend ----------------
-expense_trend = df_period.groupby("date")[expense_cols].sum().sum(axis=1).reset_index(name="Расходы")
-if not expense_trend.empty:
-    fig_expense = px.line(expense_trend, x="date", y="Расходы", title="📉 Динамика расходов")
+    # Optional drilldown
+    selected_income_cat = st.selectbox("Показать детали доходов", ["Нет"] + list(income_cats.keys()))
+    if selected_income_cat != "Нет":
+        subcols = [c for c in income_cols if c.split("-")[1] == selected_income_cat]
+        if subcols:
+            subdata = df[subcols].sum()
+            fig_sub_income = px.pie(values=subdata.values, names=subdata.index, 
+                                    title=f"Доходы: {selected_income_cat} по подкатегориям")
+            st.plotly_chart(fig_sub_income, use_container_width=True)
+
+with col2:
+    expense_cats = aggregate_by_category(expense_cols, df)
+    fig_expense = px.pie(values=list(expense_cats.values()), names=list(expense_cats.keys()), 
+                         title="Расходы по категориям")
     st.plotly_chart(fig_expense, use_container_width=True)
 
-# ---------------- Cumulative Balance Trend ----------------
-balance_trend = (
-    df_period.groupby("date")[income_cols + expense_cols]
-    .sum()
-    .reset_index()
-)
-balance_trend["Доходы"] = balance_trend[income_cols].sum(axis=1)
-balance_trend["Расходы"] = balance_trend[expense_cols].sum(axis=1)
-balance_trend["Баланс"] = (balance_trend["Доходы"] - balance_trend["Расходы"]).cumsum()
+    # Optional drilldown
+    selected_expense_cat = st.selectbox("Показать детали расходов", ["Нет"] + list(expense_cats.keys()))
+    if selected_expense_cat != "Нет":
+        subcols = [c for c in expense_cols if c.split("-")[1] == selected_expense_cat]
+        if subcols:
+            subdata = df[subcols].sum()
+            fig_sub_expense = px.pie(values=subdata.values, names=subdata.index, 
+                                     title=f"Расходы: {selected_expense_cat} по подкатегориям")
+            st.plotly_chart(fig_sub_expense, use_container_width=True)
 
-fig_balance = px.line(
-    balance_trend, x="date", y="Баланс", title="💹 Кумулятивный баланс"
-)
+# --- Balance trend ---
+st.subheader("Баланс во времени")
+fig_balance = px.line(x=df_grouped.index, y=balance, title="Изменение баланса")
 st.plotly_chart(fig_balance, use_container_width=True)
+
