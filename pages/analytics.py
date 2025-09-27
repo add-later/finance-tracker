@@ -250,3 +250,4 @@ st.subheader("Баланс во времени")
 fig_balance = px.line(x=df_grouped.index, y=balance, title="Изменение баланса")
 st.plotly_chart(fig_balance, use_container_width=True)
 
+
