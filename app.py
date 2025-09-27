@@ -93,3 +93,4 @@ if st.button("Сохранить в Google Sheets", ):
     # Append data
     sheet.append_row(list(row_data.values()))
     st.success("Данные успешно сохранены в Google Sheets!")
+
