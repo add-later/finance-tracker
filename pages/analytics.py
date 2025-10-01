@@ -67,7 +67,7 @@ def calc_cash(df, shop):
     shop_df["В кассе"] = 0.0
 
     for i in range(len(shop_df)):
-        dt = {"ЦУМ": 214628, "Галерея": 252181}
+        dt = {"ЦУМ": 164145, "Галерея": 40202}
         prev_cash = shop_df.loc[i - 1, "В кассе"] if i > 0 else dt[shop]
         shop_df.loc[i, "Наличка"] = (
             prev_cash
